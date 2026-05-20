@@ -156,6 +156,12 @@ https://你的-vercel域名/api/health
 
 如果数据库连接正常，会返回 `ok: true`。
 
+检查 bot token、频道和管理员权限：
+
+```powershell
+curl.exe "https://你的-vercel域名/api/check" -H "x-setup-secret: 你的SETUP_SECRET"
+```
+
 ## 频道权限
 
 bot 必须是频道管理员，并且需要具备邀请用户权限。Telegram Bot API 对应字段是 `can_invite_users`。
