@@ -1,0 +1,23 @@
+{
+  "name": "telegram-cdk-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegram channel invite reward bot with CDK delivery.",
+  "main": "api/webhook.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check": "node scripts/check.js",
+    "db:migrate": "node scripts/migrate.js",
+    "import-cdks": "node scripts/import-cdks.js",
+    "webhook-info": "node scripts/webhook-info.js",
+    "set-webhook": "node scripts/set-webhook.js",
+    "delete-webhook": "node scripts/delete-webhook.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "pg": "^8.16.3"
+  }
+}
