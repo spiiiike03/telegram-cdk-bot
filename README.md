@@ -88,7 +88,15 @@ curl.exe -X POST "https://你的-vercel域名/api/setup" -H "x-setup-secret: 你
 
 ## 设置 Webhook
 
-本地有 Node.js 时，在项目目录创建 `.env`，参考 `.env.example` 填好变量，然后执行：
+部署后推荐直接调用 Vercel 上的安全接口。它会使用 Vercel 环境变量里的 `BOT_TOKEN`，不用把 token 放到本地命令行：
+
+```powershell
+curl.exe -X POST "https://你的-vercel域名/api/set-webhook" -H "x-setup-secret: 你的SETUP_SECRET"
+```
+
+成功后会返回 Telegram 的 webhook 信息。
+
+本地有 Node.js 时，也可以在项目目录创建 `.env`，参考 `.env.example` 填好变量，然后执行：
 
 ```powershell
 npm install
@@ -167,7 +175,7 @@ can_invite_users: true
 查看当前 webhook 状态：
 
 ```powershell
-npm run webhook-info
+curl.exe "https://你的-vercel域名/api/webhook-info" -H "x-setup-secret: 你的SETUP_SECRET"
 ```
 
 ## 推荐上线流程
