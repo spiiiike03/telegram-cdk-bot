@@ -54,6 +54,26 @@ MAX_REWARDS_PER_INVITER=50
 
 在 Neon 创建 Postgres 项目，复制 pooled connection string，放到 `DATABASE_URL`。
 
+最简单流程：
+
+1. 打开 `https://neon.tech/`
+2. 用 GitHub 登录
+3. 点击 `New Project`
+4. 项目名可以填 `telegram-cdk-bot`
+5. 创建完成后，进入项目 Dashboard
+6. 点击 `Connect`
+7. 选择数据库 `neondb`
+8. 打开 `Connection pooling`，复制带 `-pooler` 的连接串
+9. 把这串填到 Vercel 环境变量 `DATABASE_URL`
+
+连接串应该类似这样：
+
+```text
+postgresql://用户名:密码@xxx-pooler.xxx.aws.neon.tech/neondb?sslmode=require
+```
+
+看到主机名里有 `-pooler` 就对了。
+
 部署后执行一次建表：
 
 ```powershell
