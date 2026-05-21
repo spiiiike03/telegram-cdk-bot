@@ -140,12 +140,13 @@ async function getStats(inviterId) {
   const bonusPendingRewards = bonusRewards.rows[0].pending;
   const deliveredRewards = regularDeliveredRewards + bonusDeliveredRewards;
   const pendingRewards = regularPendingRewards + bonusPendingRewards;
-  const eligibleRewards = Math.min(
-    Math.floor(activeCount / config.inviteTarget),
-    config.maxRewardsPerInviter
-  );
-  const nextAt = Math.min((totalRewards + 1) * config.inviteTarget, config.maxRewardsPerInviter * config.inviteTarget);
-  const needed = totalRewards >= config.maxRewardsPerInviter
+  const unlimitedRewards = config.maxRewardsPerInviter === 0;
+  const regularEligibleRewards = Math.floor(activeCount / config.inviteTarget);
+  const eligibleRewards = unlimitedRewards
+    ? regularEligibleRewards
+    : Math.min(regularEligibleRewards, config.maxRewardsPerInviter);
+  const nextAt = (totalRewards + 1) * config.inviteTarget;
+  const needed = !unlimitedRewards && totalRewards >= config.maxRewardsPerInviter
     ? 0
     : Math.max(0, nextAt - activeCount);
 
@@ -160,6 +161,7 @@ async function getStats(inviterId) {
     deliveredRewards,
     pendingRewards,
     eligibleRewards,
+    unlimitedRewards,
     needed
   };
 }
@@ -177,10 +179,12 @@ function statsText(link, stats) {
     "",
     `有效邀请：${stats.activeCount}`,
     `已发放 CDK：${stats.deliveredRewards}`,
-    `常规奖励：${stats.regularDeliveredRewards}/${config.maxRewardsPerInviter}`,
+    stats.unlimitedRewards
+      ? `常规奖励：${stats.regularDeliveredRewards}（无上限）`
+      : `常规奖励：${stats.regularDeliveredRewards}/${config.maxRewardsPerInviter}`,
     bonusText,
     stats.pendingRewards > 0 ? `待补发 CDK：${stats.pendingRewards}` : null,
-    stats.totalRewards >= config.maxRewardsPerInviter
+    !stats.unlimitedRewards && stats.totalRewards >= config.maxRewardsPerInviter
       ? "你已达到最高奖励次数。"
       : `距离下一个 CDK 还差：${stats.needed} 人`,
     "",
@@ -859,10 +863,10 @@ async function createBonusReward(inviterId, bonusKey, threshold, activeCount) {
 
 async function awardRewards(inviterId) {
   const stats = await getStats(inviterId);
-  const shouldHaveRewards = Math.min(
-    Math.floor(stats.activeCount / config.inviteTarget),
-    config.maxRewardsPerInviter
-  );
+  const regularEligibleRewards = Math.floor(stats.activeCount / config.inviteTarget);
+  const shouldHaveRewards = config.maxRewardsPerInviter === 0
+    ? regularEligibleRewards
+    : Math.min(regularEligibleRewards, config.maxRewardsPerInviter);
 
   for (let rewardNumber = stats.totalRewards + 1; rewardNumber <= shouldHaveRewards; rewardNumber += 1) {
     await createReward(inviterId, rewardNumber, stats.activeCount);

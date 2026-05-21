@@ -6,7 +6,7 @@
 - 新用户通过该专属链接加入频道后，bot 记录邀请关系
 - 每 5 个有效邀请自动发放 1 个 CDK
 - 邀请满 10 个有效用户时，额外发放 1 个 CDK
-- 每个邀请人最多发放 50 次常规奖励，10 人额外奖励不占用这个上限
+- 常规奖励默认无发放上限
 - 新人退频道后，有效邀请数扣回
 - 同一个新人只会绑定第一次归因，反复进出不会重复刷奖励
 
@@ -46,10 +46,12 @@ WEBHOOK_SECRET=随机长字符串
 SETUP_SECRET=另一个随机长字符串
 ADMIN_IDS=8606512131
 INVITE_TARGET=5
-MAX_REWARDS_PER_INVITER=50
+MAX_REWARDS_PER_INVITER=0
 REPORT_TIMEZONE=Asia/Shanghai
 TEN_INVITE_BONUS_THRESHOLD=10
 ```
+
+`MAX_REWARDS_PER_INVITER=0` 表示常规 CDK 发放无上限。
 
 不知道自己的 Telegram 数字 user id 时，部署后先私聊 bot 发送 `/id`。
 
