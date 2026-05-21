@@ -77,3 +77,20 @@ CREATE TABLE IF NOT EXISTS rewards (
 CREATE INDEX IF NOT EXISTS rewards_pending_idx
   ON rewards(id)
   WHERE cdk_id IS NULL;
+
+CREATE TABLE IF NOT EXISTS bonus_rewards (
+  id BIGSERIAL PRIMARY KEY,
+  inviter_id BIGINT NOT NULL REFERENCES inviters(user_id),
+  bonus_key TEXT NOT NULL,
+  threshold INTEGER NOT NULL,
+  active_count_at_award INTEGER NOT NULL,
+  cdk_id BIGINT UNIQUE REFERENCES cdks(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  delivered_at TIMESTAMPTZ,
+  delivery_error TEXT,
+  UNIQUE(inviter_id, bonus_key)
+);
+
+CREATE INDEX IF NOT EXISTS bonus_rewards_pending_idx
+  ON bonus_rewards(id)
+  WHERE cdk_id IS NULL;

@@ -45,7 +45,8 @@ const config = {
   adminIds: parseAdmins(process.env.ADMIN_IDS),
   inviteTarget: optionalInt("INVITE_TARGET", 5),
   maxRewardsPerInviter: optionalInt("MAX_REWARDS_PER_INVITER", 50),
-  reportTimezone: process.env.REPORT_TIMEZONE || "Asia/Shanghai"
+  reportTimezone: process.env.REPORT_TIMEZONE || "Asia/Shanghai",
+  tenInviteBonusThreshold: optionalInt("TEN_INVITE_BONUS_THRESHOLD", 10)
 };
 
 module.exports = {

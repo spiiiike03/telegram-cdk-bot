@@ -3,6 +3,7 @@ const { query, transaction } = require("./db");
 const { createInviteLink, notifyAdmins, sendMessage, telegram } = require("./telegram");
 
 const ACTIVE_STATUSES = new Set(["creator", "administrator", "member"]);
+const TEN_INVITE_BONUS_KEY = "ten_invites";
 
 function userId(user) {
   return String(user.id);
@@ -118,11 +119,27 @@ async function getStats(inviterId) {
     `,
     [inviterId]
   );
+  const bonusRewards = await query(
+    `
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(cdk_id)::int AS delivered,
+        COUNT(*) FILTER (WHERE cdk_id IS NULL)::int AS pending
+      FROM bonus_rewards
+      WHERE inviter_id = $1
+    `,
+    [inviterId]
+  );
 
   const activeCount = active.rows[0].count;
   const totalRewards = rewards.rows[0].total;
-  const deliveredRewards = rewards.rows[0].delivered;
-  const pendingRewards = rewards.rows[0].pending;
+  const regularDeliveredRewards = rewards.rows[0].delivered;
+  const regularPendingRewards = rewards.rows[0].pending;
+  const bonusTotalRewards = bonusRewards.rows[0].total;
+  const bonusDeliveredRewards = bonusRewards.rows[0].delivered;
+  const bonusPendingRewards = bonusRewards.rows[0].pending;
+  const deliveredRewards = regularDeliveredRewards + bonusDeliveredRewards;
+  const pendingRewards = regularPendingRewards + bonusPendingRewards;
   const eligibleRewards = Math.min(
     Math.floor(activeCount / config.inviteTarget),
     config.maxRewardsPerInviter
@@ -135,6 +152,11 @@ async function getStats(inviterId) {
   return {
     activeCount,
     totalRewards,
+    regularDeliveredRewards,
+    regularPendingRewards,
+    bonusTotalRewards,
+    bonusDeliveredRewards,
+    bonusPendingRewards,
     deliveredRewards,
     pendingRewards,
     eligibleRewards,
@@ -143,12 +165,20 @@ async function getStats(inviterId) {
 }
 
 function statsText(link, stats) {
+  const bonusText = stats.bonusDeliveredRewards > 0
+    ? `10人额外奖励：已发放 ${stats.bonusDeliveredRewards} 个 CDK`
+    : stats.bonusPendingRewards > 0
+      ? "10人额外奖励：已达成，待补发"
+      : `10人额外奖励：还差 ${Math.max(0, config.tenInviteBonusThreshold - stats.activeCount)} 人`;
+
   return [
     "你的专属邀请链接：",
     link,
     "",
     `有效邀请：${stats.activeCount}`,
-    `已发放 CDK：${stats.deliveredRewards}/${config.maxRewardsPerInviter}`,
+    `已发放 CDK：${stats.deliveredRewards}`,
+    `常规奖励：${stats.regularDeliveredRewards}/${config.maxRewardsPerInviter}`,
+    bonusText,
     stats.pendingRewards > 0 ? `待补发 CDK：${stats.pendingRewards}` : null,
     stats.totalRewards >= config.maxRewardsPerInviter
       ? "你已达到最高奖励次数。"
@@ -160,6 +190,7 @@ function statsText(link, stats) {
 
 async function sendUserStats(user, chatId) {
   const link = await getOrCreateInviteLink(user);
+  await awardRewards(userId(user));
   const stats = await getStats(userId(user));
   await sendMessage(chatId, statsText(link, stats));
 }
@@ -196,7 +227,10 @@ async function sendInventory(chatId) {
       SELECT
         COUNT(*) FILTER (WHERE used_by IS NULL)::int AS unused,
         COUNT(*) FILTER (WHERE used_by IS NOT NULL)::int AS used,
-        (SELECT COUNT(*)::int FROM rewards WHERE cdk_id IS NULL) AS pending
+        (
+          (SELECT COUNT(*)::int FROM rewards WHERE cdk_id IS NULL) +
+          (SELECT COUNT(*)::int FROM bonus_rewards WHERE cdk_id IS NULL)
+        ) AS pending
       FROM cdks
     `
   );
@@ -235,9 +269,20 @@ async function sendAdminStats(chatId) {
         (SELECT COUNT(*)::int FROM channel_members WHERE active = TRUE) AS active_channel_members,
         (SELECT COUNT(*)::int FROM cdks WHERE used_by IS NULL) AS unused_cdks,
         (SELECT COUNT(*)::int FROM cdks WHERE used_by IS NOT NULL) AS used_cdks,
-        (SELECT COUNT(*)::int FROM rewards) AS total_rewards,
-        (SELECT COUNT(*)::int FROM rewards WHERE cdk_id IS NOT NULL) AS delivered_rewards,
-        (SELECT COUNT(*)::int FROM rewards WHERE cdk_id IS NULL) AS pending_rewards
+        (SELECT COUNT(*)::int FROM rewards) AS regular_rewards,
+        (SELECT COUNT(*)::int FROM bonus_rewards) AS bonus_rewards,
+        (
+          (SELECT COUNT(*)::int FROM rewards) +
+          (SELECT COUNT(*)::int FROM bonus_rewards)
+        ) AS total_rewards,
+        (
+          (SELECT COUNT(*)::int FROM rewards WHERE cdk_id IS NOT NULL) +
+          (SELECT COUNT(*)::int FROM bonus_rewards WHERE cdk_id IS NOT NULL)
+        ) AS delivered_rewards,
+        (
+          (SELECT COUNT(*)::int FROM rewards WHERE cdk_id IS NULL) +
+          (SELECT COUNT(*)::int FROM bonus_rewards WHERE cdk_id IS NULL)
+        ) AS pending_rewards
     `
   );
 
@@ -255,6 +300,8 @@ async function sendAdminStats(chatId) {
       `CDK 库存：${row.unused_cdks}`,
       `CDK 已用：${row.used_cdks}`,
       `奖励记录：${row.total_rewards}`,
+      `常规奖励：${row.regular_rewards}`,
+      `10人额外奖励：${row.bonus_rewards}`,
       `已发奖励：${row.delivered_rewards}`,
       `待补发奖励：${row.pending_rewards}`
     ].join("\n")
@@ -359,6 +406,11 @@ async function sendInviterDetail(chatId, text) {
     `有效邀请：${stats.activeCount}`,
     `总邀请记录：${total.rows[0].count}`,
     `已发 CDK：${stats.deliveredRewards}`,
+    stats.bonusDeliveredRewards > 0
+      ? `10人额外奖励：已发放`
+      : stats.bonusPendingRewards > 0
+        ? `10人额外奖励：待补发`
+        : `10人额外奖励：${stats.activeCount >= config.tenInviteBonusThreshold ? "已达成未发放" : "未达成"}`,
     `待补发 CDK：${stats.pendingRewards}`,
     ""
   ];
@@ -388,6 +440,7 @@ async function sendAdminHelp(chatId) {
       "/stats - 查看后台总览",
       "/top - 查看今日有效邀请 TOP 5",
       "/user 123456789 - 查看邀请人和被邀请人明细",
+      "/syncrewards - 同步已达标但未发放的奖励",
       "/addcdk CODE1 CODE2 - 导入 CDK"
     ].join("\n")
   );
@@ -460,6 +513,16 @@ async function handleMessage(message) {
       return;
     }
     await sendInviterDetail(message.chat.id, text);
+    return;
+  }
+
+  if (command === "/syncrewards") {
+    if (!isAdmin(message.from)) {
+      await sendMessage(message.chat.id, "没有权限。");
+      return;
+    }
+    const count = await syncEligibleRewards();
+    await sendMessage(message.chat.id, `奖励同步完成，已检查 ${count} 个符合奖励门槛的邀请人。`);
     return;
   }
 
@@ -679,6 +742,30 @@ async function deliverReward(rewardId, inviterId, cdkCode, rewardNumber) {
   }
 }
 
+async function deliverBonusReward(rewardId, inviterId, cdkCode, threshold) {
+  try {
+    await sendMessage(
+      inviterId,
+      [
+        `你已达成邀请满 ${threshold} 人额外奖励。`,
+        `额外 CDK：${cdkCode}`,
+        "",
+        "请妥善保存，每个 CDK 只能使用一次。"
+      ].join("\n")
+    );
+    await query(
+      "UPDATE bonus_rewards SET delivered_at = NOW(), delivery_error = NULL WHERE id = $1",
+      [rewardId]
+    );
+  } catch (error) {
+    await query(
+      "UPDATE bonus_rewards SET delivery_error = $2 WHERE id = $1",
+      [rewardId, error.message.slice(0, 500)]
+    );
+    await notifyAdmins(`额外 CDK 发放失败：用户 ${inviterId}，门槛 ${threshold} 人，错误：${error.message}`);
+  }
+}
+
 async function createReward(inviterId, rewardNumber, activeCount) {
   const result = await transaction(async (client) => {
     const existing = await client.query(
@@ -724,6 +811,52 @@ async function createReward(inviterId, rewardNumber, activeCount) {
   }
 }
 
+async function createBonusReward(inviterId, bonusKey, threshold, activeCount) {
+  const result = await transaction(async (client) => {
+    const existing = await client.query(
+      "SELECT id, cdk_id FROM bonus_rewards WHERE inviter_id = $1 AND bonus_key = $2 FOR UPDATE",
+      [inviterId, bonusKey]
+    );
+    if (existing.rows[0]) return null;
+
+    const cdk = await reserveCdk(client, inviterId);
+    const reward = await client.query(
+      `
+        INSERT INTO bonus_rewards (
+          inviter_id, bonus_key, threshold, active_count_at_award, cdk_id, delivery_error
+        )
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id
+      `,
+      [
+        inviterId,
+        bonusKey,
+        threshold,
+        activeCount,
+        cdk ? cdk.id : null,
+        cdk ? null : "NO_CDK_STOCK"
+      ]
+    );
+
+    return {
+      rewardId: reward.rows[0].id,
+      cdkCode: cdk ? cdk.code : null
+    };
+  });
+
+  if (!result) return;
+
+  if (result.cdkCode) {
+    await deliverBonusReward(result.rewardId, inviterId, result.cdkCode, threshold);
+  } else {
+    await sendMessage(
+      inviterId,
+      `你已达成邀请满 ${threshold} 人额外奖励，但当前 CDK 库存不足。补货后会自动补发。`
+    ).catch(() => null);
+    await notifyAdmins(`CDK 库存不足：用户 ${inviterId} 已达成邀请满 ${threshold} 人额外奖励。`);
+  }
+}
+
 async function awardRewards(inviterId) {
   const stats = await getStats(inviterId);
   const shouldHaveRewards = Math.min(
@@ -733,6 +866,15 @@ async function awardRewards(inviterId) {
 
   for (let rewardNumber = stats.totalRewards + 1; rewardNumber <= shouldHaveRewards; rewardNumber += 1) {
     await createReward(inviterId, rewardNumber, stats.activeCount);
+  }
+
+  if (stats.activeCount >= config.tenInviteBonusThreshold) {
+    await createBonusReward(
+      inviterId,
+      TEN_INVITE_BONUS_KEY,
+      config.tenInviteBonusThreshold,
+      stats.activeCount
+    );
   }
 
   await fulfillPendingRewardsForInviter(inviterId);
@@ -791,16 +933,95 @@ async function fulfillPendingRewardsForInviter(inviterId) {
       await deliverReward(reward.id, inviterId, reserved.cdkCode, reward.reward_number);
     }
   }
+
+  const pendingBonuses = await query(
+    `
+      SELECT id, bonus_key, threshold
+      FROM bonus_rewards
+      WHERE inviter_id = $1 AND cdk_id IS NULL
+      ORDER BY threshold, id
+    `,
+    [inviterId]
+  );
+
+  for (const reward of pendingBonuses.rows) {
+    if (activeCount < reward.threshold) {
+      await query(
+        "UPDATE bonus_rewards SET delivery_error = $2 WHERE id = $1",
+        [reward.id, "WAITING_ACTIVE_COUNT"]
+      );
+      continue;
+    }
+
+    const reserved = await transaction(async (client) => {
+      const locked = await client.query(
+        "SELECT id FROM bonus_rewards WHERE id = $1 AND cdk_id IS NULL FOR UPDATE",
+        [reward.id]
+      );
+      if (!locked.rows[0]) return null;
+
+      const cdk = await reserveCdk(client, inviterId);
+      if (!cdk) {
+        await client.query(
+          "UPDATE bonus_rewards SET delivery_error = $2 WHERE id = $1",
+          [reward.id, "NO_CDK_STOCK"]
+        );
+        return null;
+      }
+
+      await client.query(
+        "UPDATE bonus_rewards SET cdk_id = $2, delivery_error = NULL WHERE id = $1",
+        [reward.id, cdk.id]
+      );
+
+      return { cdkCode: cdk.code };
+    });
+
+    if (reserved) {
+      await deliverBonusReward(reward.id, inviterId, reserved.cdkCode, reward.threshold);
+    }
+  }
 }
 
 async function fulfillAllPendingRewards() {
+  await syncEligibleRewards();
+
   const inviters = await query(
-    "SELECT DISTINCT inviter_id FROM rewards WHERE cdk_id IS NULL ORDER BY inviter_id"
+    `
+      SELECT DISTINCT inviter_id
+      FROM rewards
+      WHERE cdk_id IS NULL
+      UNION
+      SELECT DISTINCT inviter_id
+      FROM bonus_rewards
+      WHERE cdk_id IS NULL
+      ORDER BY inviter_id
+    `
   );
 
   for (const row of inviters.rows) {
     await fulfillPendingRewardsForInviter(String(row.inviter_id));
   }
+}
+
+async function syncEligibleRewards() {
+  const inviters = await query(
+    `
+      SELECT inviter_id::text AS inviter_id
+      FROM referrals
+      WHERE active = TRUE
+      GROUP BY inviter_id
+      HAVING COUNT(*) >= $1
+      ORDER BY inviter_id
+    `,
+    [Math.min(config.inviteTarget, config.tenInviteBonusThreshold)]
+  );
+
+  for (const row of inviters.rows) {
+    await awardRewards(row.inviter_id);
+  }
+
+  return inviters.rows.length;
 }
 
 async function handleUpdate(update) {
