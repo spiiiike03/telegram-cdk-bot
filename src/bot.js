@@ -27,6 +27,17 @@ function formatDate(value) {
   return new Date(value).toISOString().replace("T", " ").slice(0, 16);
 }
 
+function formatReportDate(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: config.reportTimezone,
+    month: "numeric",
+    day: "numeric"
+  }).formatToParts(date);
+  const month = parts.find((part) => part.type === "month").value;
+  const day = parts.find((part) => part.type === "day").value;
+  return `${month}月${day}日`;
+}
+
 function isAdmin(user) {
   return config.adminIds.has(userId(user));
 }
@@ -254,39 +265,43 @@ async function sendTopInviters(chatId) {
   const excludedIds = await getLeaderboardExcludedIds();
   const result = await query(
     `
+      WITH bounds AS (
+        SELECT
+          (date_trunc('day', NOW() AT TIME ZONE $2) AT TIME ZONE $2) AS start_at,
+          ((date_trunc('day', NOW() AT TIME ZONE $2) + INTERVAL '1 day') AT TIME ZONE $2) AS end_at
+      )
       SELECT
         i.user_id::text AS user_id,
         i.username,
         i.first_name,
         i.last_name,
-        COUNT(*) FILTER (WHERE r.active = TRUE)::int AS active_count,
-        COUNT(*)::int AS total_count,
-        COALESCE(rw.delivered_rewards, 0)::int AS delivered_rewards
-      FROM inviters i
-      JOIN referrals r ON r.inviter_id = i.user_id
-      LEFT JOIN (
-        SELECT inviter_id, COUNT(cdk_id)::int AS delivered_rewards
-        FROM rewards
-        GROUP BY inviter_id
-      ) rw ON rw.inviter_id = i.user_id
+        COUNT(*)::int AS invite_count
+      FROM bounds
+      JOIN referrals r ON
+        r.active = TRUE
+        AND r.joined_at >= bounds.start_at
+        AND r.joined_at < bounds.end_at
+      JOIN inviters i ON i.user_id = r.inviter_id
       WHERE NOT (i.user_id = ANY($1::bigint[]))
-      GROUP BY i.user_id, i.username, i.first_name, i.last_name, rw.delivered_rewards
-      HAVING COUNT(*) FILTER (WHERE r.active = TRUE) > 0
-      ORDER BY active_count DESC, total_count DESC, i.user_id ASC
+      GROUP BY i.user_id, i.username, i.first_name, i.last_name
+      HAVING COUNT(*) > 0
+      ORDER BY invite_count DESC, i.user_id ASC
       LIMIT 5
     `,
-    [excludedIds]
+    [excludedIds, config.reportTimezone]
   );
 
   if (result.rows.length === 0) {
-    await sendMessage(chatId, "暂无有效邀请排行榜。");
+    await sendMessage(chatId, `🏆 邀请排行榜 TOP 5（${formatReportDate()}实时更新）\n暂无有效邀请。`);
     return;
   }
 
-  const lines = ["邀请排行榜 TOP 5（仅有效邀请，已排除管理员）"];
+  const rankIcons = ["🥇", "🥈", "🥉"];
+  const lines = [`🏆 邀请排行榜 TOP 5（${formatReportDate()}实时更新）`];
   result.rows.forEach((row, index) => {
+    const rank = rankIcons[index] || `${index + 1}.`;
     lines.push(
-      `${index + 1}. ${displayDbName(row)} | 有效 ${row.active_count} | 总 ${row.total_count} | CDK ${row.delivered_rewards}`
+      `${rank} ${displayDbName(row)} 邀请${row.invite_count}人`
     );
   });
 
@@ -371,7 +386,7 @@ async function sendAdminHelp(chatId) {
       "管理员命令",
       "/inventory - 查看 CDK 库存",
       "/stats - 查看后台总览",
-      "/top - 查看有效邀请 TOP 5",
+      "/top - 查看今日有效邀请 TOP 5",
       "/user 123456789 - 查看邀请人和被邀请人明细",
       "/addcdk CODE1 CODE2 - 导入 CDK"
     ].join("\n")

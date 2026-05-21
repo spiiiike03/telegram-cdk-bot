@@ -44,7 +44,8 @@ const config = {
   setupSecret: process.env.SETUP_SECRET || "",
   adminIds: parseAdmins(process.env.ADMIN_IDS),
   inviteTarget: optionalInt("INVITE_TARGET", 5),
-  maxRewardsPerInviter: optionalInt("MAX_REWARDS_PER_INVITER", 50)
+  maxRewardsPerInviter: optionalInt("MAX_REWARDS_PER_INVITER", 50),
+  reportTimezone: process.env.REPORT_TIMEZONE || "Asia/Shanghai"
 };
 
 module.exports = {
