@@ -5,6 +5,10 @@ const { createInviteLink, notifyAdmins, sendMessage, telegram } = require("./tel
 const ACTIVE_STATUSES = new Set(["creator", "administrator", "member"]);
 const TEN_INVITE_BONUS_KEY = "ten_invites";
 
+function bonusKeyForTier(tier) {
+  return tier === 1 ? TEN_INVITE_BONUS_KEY : `${TEN_INVITE_BONUS_KEY}_${tier}`;
+}
+
 function userId(user) {
   return String(user.id);
 }
@@ -142,6 +146,7 @@ async function getStats(inviterId) {
   const pendingRewards = regularPendingRewards + bonusPendingRewards;
   const unlimitedRewards = config.maxRewardsPerInviter === 0;
   const regularEligibleRewards = Math.floor(activeCount / config.inviteTarget);
+  const bonusEligibleRewards = Math.floor(activeCount / config.tenInviteBonusThreshold);
   const eligibleRewards = unlimitedRewards
     ? regularEligibleRewards
     : Math.min(regularEligibleRewards, config.maxRewardsPerInviter);
@@ -149,6 +154,8 @@ async function getStats(inviterId) {
   const needed = !unlimitedRewards && totalRewards >= config.maxRewardsPerInviter
     ? 0
     : Math.max(0, nextAt - activeCount);
+  const nextBonusAt = (bonusTotalRewards + 1) * config.tenInviteBonusThreshold;
+  const bonusNeeded = Math.max(0, nextBonusAt - activeCount);
 
   return {
     activeCount,
@@ -158,20 +165,25 @@ async function getStats(inviterId) {
     bonusTotalRewards,
     bonusDeliveredRewards,
     bonusPendingRewards,
+    bonusEligibleRewards,
     deliveredRewards,
     pendingRewards,
     eligibleRewards,
     unlimitedRewards,
-    needed
+    needed,
+    bonusNeeded
   };
 }
 
 function statsText(link, stats) {
-  const bonusText = stats.bonusDeliveredRewards > 0
-    ? `10人额外奖励：已发放 ${stats.bonusDeliveredRewards} 个 CDK`
+  const bonusPendingText = stats.bonusPendingRewards > 0
+    ? `，待补发 ${stats.bonusPendingRewards} 个`
+    : "";
+  const bonusText = stats.bonusTotalRewards > 0
+    ? `每满 ${config.tenInviteBonusThreshold} 人额外奖励：已达成 ${stats.bonusTotalRewards} 次，已发放 ${stats.bonusDeliveredRewards} 个 CDK${bonusPendingText}`
     : stats.bonusPendingRewards > 0
-      ? "10人额外奖励：已达成，待补发"
-      : `10人额外奖励：还差 ${Math.max(0, config.tenInviteBonusThreshold - stats.activeCount)} 人`;
+      ? `每满 ${config.tenInviteBonusThreshold} 人额外奖励：已达成，待补发`
+      : `每满 ${config.tenInviteBonusThreshold} 人额外奖励：还差 ${stats.bonusNeeded} 人`;
 
   return [
     "你的专属邀请链接：",
@@ -305,7 +317,7 @@ async function sendAdminStats(chatId) {
       `CDK 已用：${row.used_cdks}`,
       `奖励记录：${row.total_rewards}`,
       `常规奖励：${row.regular_rewards}`,
-      `10人额外奖励：${row.bonus_rewards}`,
+      `每满 ${config.tenInviteBonusThreshold} 人额外奖励：${row.bonus_rewards}`,
       `已发奖励：${row.delivered_rewards}`,
       `待补发奖励：${row.pending_rewards}`
     ].join("\n")
@@ -410,11 +422,11 @@ async function sendInviterDetail(chatId, text) {
     `有效邀请：${stats.activeCount}`,
     `总邀请记录：${total.rows[0].count}`,
     `已发 CDK：${stats.deliveredRewards}`,
-    stats.bonusDeliveredRewards > 0
-      ? `10人额外奖励：已发放`
+    stats.bonusTotalRewards > 0
+      ? `每满 ${config.tenInviteBonusThreshold} 人额外奖励：已达成 ${stats.bonusTotalRewards} 次，已发放 ${stats.bonusDeliveredRewards} 次${stats.bonusPendingRewards > 0 ? `，待补发 ${stats.bonusPendingRewards} 次` : ""}`
       : stats.bonusPendingRewards > 0
-        ? `10人额外奖励：待补发`
-        : `10人额外奖励：${stats.activeCount >= config.tenInviteBonusThreshold ? "已达成未发放" : "未达成"}`,
+        ? `每满 ${config.tenInviteBonusThreshold} 人额外奖励：待补发`
+        : `每满 ${config.tenInviteBonusThreshold} 人额外奖励：还差 ${stats.bonusNeeded} 人`,
     `待补发 CDK：${stats.pendingRewards}`,
     ""
   ];
@@ -872,11 +884,13 @@ async function awardRewards(inviterId) {
     await createReward(inviterId, rewardNumber, stats.activeCount);
   }
 
-  if (stats.activeCount >= config.tenInviteBonusThreshold) {
+  const bonusEligibleRewards = Math.floor(stats.activeCount / config.tenInviteBonusThreshold);
+  for (let bonusNumber = stats.bonusTotalRewards + 1; bonusNumber <= bonusEligibleRewards; bonusNumber += 1) {
+    const threshold = bonusNumber * config.tenInviteBonusThreshold;
     await createBonusReward(
       inviterId,
-      TEN_INVITE_BONUS_KEY,
-      config.tenInviteBonusThreshold,
+      bonusKeyForTier(bonusNumber),
+      threshold,
       stats.activeCount
     );
   }
