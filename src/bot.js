@@ -1,6 +1,6 @@
 const { config, normalizeUsername } = require("./config");
 const { query, transaction } = require("./db");
-const { createInviteLink, notifyAdmins, sendMessage } = require("./telegram");
+const { createInviteLink, notifyAdmins, sendMessage, telegram } = require("./telegram");
 
 const ACTIVE_STATUSES = new Set(["creator", "administrator", "member"]);
 
@@ -15,6 +15,16 @@ function username(user) {
 function displayName(user) {
   const parts = [user.first_name, user.last_name].filter(Boolean);
   return username(user) || parts.join(" ") || userId(user);
+}
+
+function displayDbName(row, idField = "user_id") {
+  const parts = [row.first_name, row.last_name].filter(Boolean);
+  return row.username || parts.join(" ") || String(row[idField]);
+}
+
+function formatDate(value) {
+  if (!value) return "-";
+  return new Date(value).toISOString().replace("T", " ").slice(0, 16);
 }
 
 function isAdmin(user) {
@@ -183,6 +193,191 @@ async function sendInventory(chatId) {
   await sendMessage(chatId, `CDK 库存：${row.unused}\n已使用：${row.used}\n待补发：${row.pending}`);
 }
 
+async function getLeaderboardExcludedIds() {
+  const excluded = new Set(config.adminIds);
+
+  try {
+    const admins = await telegram("getChatAdministrators", {
+      chat_id: config.channelId || config.channelUsername
+    });
+
+    for (const admin of admins) {
+      if (admin.user && admin.user.id) {
+        excluded.add(String(admin.user.id));
+      }
+    }
+  } catch (_) {
+    // Keep leaderboard usable even if Telegram refuses the admin list.
+  }
+
+  return [...excluded];
+}
+
+async function sendAdminStats(chatId) {
+  const result = await query(
+    `
+      SELECT
+        (SELECT COUNT(*)::int FROM inviters) AS inviters,
+        (SELECT COUNT(*)::int FROM referrals) AS total_referrals,
+        (SELECT COUNT(*)::int FROM referrals WHERE active = TRUE) AS active_referrals,
+        (SELECT COUNT(*)::int FROM referrals WHERE active = FALSE) AS inactive_referrals,
+        (SELECT COUNT(*)::int FROM channel_members WHERE active = TRUE) AS active_channel_members,
+        (SELECT COUNT(*)::int FROM cdks WHERE used_by IS NULL) AS unused_cdks,
+        (SELECT COUNT(*)::int FROM cdks WHERE used_by IS NOT NULL) AS used_cdks,
+        (SELECT COUNT(*)::int FROM rewards) AS total_rewards,
+        (SELECT COUNT(*)::int FROM rewards WHERE cdk_id IS NOT NULL) AS delivered_rewards,
+        (SELECT COUNT(*)::int FROM rewards WHERE cdk_id IS NULL) AS pending_rewards
+    `
+  );
+
+  const row = result.rows[0];
+  await sendMessage(
+    chatId,
+    [
+      "后台总览",
+      `邀请人：${row.inviters}`,
+      `邀请记录：${row.total_referrals}`,
+      `有效邀请：${row.active_referrals}`,
+      `已退/失效：${row.inactive_referrals}`,
+      `当前频道成员记录：${row.active_channel_members}`,
+      "",
+      `CDK 库存：${row.unused_cdks}`,
+      `CDK 已用：${row.used_cdks}`,
+      `奖励记录：${row.total_rewards}`,
+      `已发奖励：${row.delivered_rewards}`,
+      `待补发奖励：${row.pending_rewards}`
+    ].join("\n")
+  );
+}
+
+async function sendTopInviters(chatId) {
+  const excludedIds = await getLeaderboardExcludedIds();
+  const result = await query(
+    `
+      SELECT
+        i.user_id::text AS user_id,
+        i.username,
+        i.first_name,
+        i.last_name,
+        COUNT(*) FILTER (WHERE r.active = TRUE)::int AS active_count,
+        COUNT(*)::int AS total_count,
+        COALESCE(rw.delivered_rewards, 0)::int AS delivered_rewards
+      FROM inviters i
+      JOIN referrals r ON r.inviter_id = i.user_id
+      LEFT JOIN (
+        SELECT inviter_id, COUNT(cdk_id)::int AS delivered_rewards
+        FROM rewards
+        GROUP BY inviter_id
+      ) rw ON rw.inviter_id = i.user_id
+      WHERE NOT (i.user_id = ANY($1::bigint[]))
+      GROUP BY i.user_id, i.username, i.first_name, i.last_name, rw.delivered_rewards
+      HAVING COUNT(*) FILTER (WHERE r.active = TRUE) > 0
+      ORDER BY active_count DESC, total_count DESC, i.user_id ASC
+      LIMIT 5
+    `,
+    [excludedIds]
+  );
+
+  if (result.rows.length === 0) {
+    await sendMessage(chatId, "暂无有效邀请排行榜。");
+    return;
+  }
+
+  const lines = ["邀请排行榜 TOP 5（仅有效邀请，已排除管理员）"];
+  result.rows.forEach((row, index) => {
+    lines.push(
+      `${index + 1}. ${displayDbName(row)} | 有效 ${row.active_count} | 总 ${row.total_count} | CDK ${row.delivered_rewards}`
+    );
+  });
+
+  await sendMessage(chatId, lines.join("\n"));
+}
+
+async function sendInviterDetail(chatId, text) {
+  const target = text
+    .replace(/^\/user(?:@\w+)?/i, "")
+    .trim();
+
+  if (!target) {
+    await sendMessage(chatId, "用法：/user 123456789 或 /user @username");
+    return;
+  }
+
+  const result = target.startsWith("@")
+    ? await query("SELECT * FROM inviters WHERE lower(username) = lower($1)", [target])
+    : await query("SELECT * FROM inviters WHERE user_id = $1", [target]);
+
+  const inviter = result.rows[0];
+  if (!inviter) {
+    await sendMessage(chatId, "没有找到这个邀请人。");
+    return;
+  }
+
+  const stats = await getStats(String(inviter.user_id));
+  const total = await query(
+    "SELECT COUNT(*)::int AS count FROM referrals WHERE inviter_id = $1",
+    [inviter.user_id]
+  );
+  const referrals = await query(
+    `
+      SELECT
+        invited_user_id::text AS invited_user_id,
+        invited_username AS username,
+        invited_first_name AS first_name,
+        invited_last_name AS last_name,
+        active,
+        joined_at,
+        left_at
+      FROM referrals
+      WHERE inviter_id = $1
+      ORDER BY joined_at DESC
+      LIMIT 20
+    `,
+    [inviter.user_id]
+  );
+
+  const lines = [
+    `邀请人：${displayDbName(inviter)}`,
+    `ID：${inviter.user_id}`,
+    inviter.invite_link ? `邀请链接：${inviter.invite_link}` : "邀请链接：未生成",
+    "",
+    `有效邀请：${stats.activeCount}`,
+    `总邀请记录：${total.rows[0].count}`,
+    `已发 CDK：${stats.deliveredRewards}`,
+    `待补发 CDK：${stats.pendingRewards}`,
+    ""
+  ];
+
+  if (referrals.rows.length === 0) {
+    lines.push("被邀请人：暂无");
+  } else {
+    lines.push("被邀请人（最近 20 条）：");
+    referrals.rows.forEach((row, index) => {
+      const status = row.active ? "有效" : "已退";
+      const left = row.left_at ? `，退：${formatDate(row.left_at)}` : "";
+      lines.push(
+        `${index + 1}. ${displayDbName(row, "invited_user_id")} (${row.invited_user_id}) ${status}，进：${formatDate(row.joined_at)}${left}`
+      );
+    });
+  }
+
+  await sendMessage(chatId, lines.join("\n"));
+}
+
+async function sendAdminHelp(chatId) {
+  await sendMessage(
+    chatId,
+    [
+      "管理员命令",
+      "/inventory - 查看 CDK 库存",
+      "/stats - 查看后台总览",
+      "/top - 查看有效邀请 TOP 5",
+      "/user 123456789 - 查看邀请人和被邀请人明细",
+      "/addcdk CODE1 CODE2 - 导入 CDK"
+    ].join("\n")
+  );
+}
+
 async function handleMessage(message) {
   if (!message.from || message.chat.type !== "private") return;
 
@@ -214,6 +409,42 @@ async function handleMessage(message) {
       return;
     }
     await sendInventory(message.chat.id);
+    return;
+  }
+
+  if (command === "/admin") {
+    if (!isAdmin(message.from)) {
+      await sendMessage(message.chat.id, "没有权限。");
+      return;
+    }
+    await sendAdminHelp(message.chat.id);
+    return;
+  }
+
+  if (command === "/stats") {
+    if (!isAdmin(message.from)) {
+      await sendMessage(message.chat.id, "没有权限。");
+      return;
+    }
+    await sendAdminStats(message.chat.id);
+    return;
+  }
+
+  if (command === "/top" || command === "/rank") {
+    if (!isAdmin(message.from)) {
+      await sendMessage(message.chat.id, "没有权限。");
+      return;
+    }
+    await sendTopInviters(message.chat.id);
+    return;
+  }
+
+  if (command === "/user") {
+    if (!isAdmin(message.from)) {
+      await sendMessage(message.chat.id, "没有权限。");
+      return;
+    }
+    await sendInviterDetail(message.chat.id, text);
     return;
   }
 
