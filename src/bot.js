@@ -805,29 +805,32 @@ async function deliverBonusReward(rewardId, inviterId, cdkCode, threshold) {
 
 async function createReward(inviterId, rewardNumber, activeCount) {
   const result = await transaction(async (client) => {
-    const existing = await client.query(
-      "SELECT id, cdk_id FROM rewards WHERE inviter_id = $1 AND reward_number = $2 FOR UPDATE",
-      [inviterId, rewardNumber]
-    );
-    if (existing.rows[0]) return null;
-
-    const cdk = await reserveCdk(client, inviterId);
     const reward = await client.query(
       `
         INSERT INTO rewards (
           inviter_id, reward_number, active_count_at_award, cdk_id, delivery_error
         )
         VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (inviter_id, reward_number) DO NOTHING
         RETURNING id
       `,
       [
         inviterId,
         rewardNumber,
         activeCount,
-        cdk ? cdk.id : null,
-        cdk ? null : "NO_CDK_STOCK"
+        null,
+        "NO_CDK_STOCK"
       ]
     );
+    if (!reward.rows[0]) return null;
+
+    const cdk = await reserveCdk(client, inviterId);
+    if (cdk) {
+      await client.query(
+        "UPDATE rewards SET cdk_id = $2, delivery_error = NULL WHERE id = $1",
+        [reward.rows[0].id, cdk.id]
+      );
+    }
 
     return {
       rewardId: reward.rows[0].id,
@@ -850,19 +853,13 @@ async function createReward(inviterId, rewardNumber, activeCount) {
 
 async function createBonusReward(inviterId, bonusKey, threshold, activeCount) {
   const result = await transaction(async (client) => {
-    const existing = await client.query(
-      "SELECT id, cdk_id FROM bonus_rewards WHERE inviter_id = $1 AND bonus_key = $2 FOR UPDATE",
-      [inviterId, bonusKey]
-    );
-    if (existing.rows[0]) return null;
-
-    const cdk = await reserveCdk(client, inviterId);
     const reward = await client.query(
       `
         INSERT INTO bonus_rewards (
           inviter_id, bonus_key, threshold, active_count_at_award, cdk_id, delivery_error
         )
         VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (inviter_id, bonus_key) DO NOTHING
         RETURNING id
       `,
       [
@@ -870,10 +867,19 @@ async function createBonusReward(inviterId, bonusKey, threshold, activeCount) {
         bonusKey,
         threshold,
         activeCount,
-        cdk ? cdk.id : null,
-        cdk ? null : "NO_CDK_STOCK"
+        null,
+        "NO_CDK_STOCK"
       ]
     );
+    if (!reward.rows[0]) return null;
+
+    const cdk = await reserveCdk(client, inviterId);
+    if (cdk) {
+      await client.query(
+        "UPDATE bonus_rewards SET cdk_id = $2, delivery_error = NULL WHERE id = $1",
+        [reward.rows[0].id, cdk.id]
+      );
+    }
 
     return {
       rewardId: reward.rows[0].id,
