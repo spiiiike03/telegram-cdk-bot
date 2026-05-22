@@ -4,6 +4,7 @@ const { createInviteLink, notifyAdmins, sendMessage, telegram } = require("./tel
 
 const ACTIVE_STATUSES = new Set(["creator", "administrator", "member"]);
 const TEN_INVITE_BONUS_KEY = "ten_invites";
+const POSTGRES_BIGINT_MAX = 9223372036854775807n;
 
 function bonusKeyForTier(tier) {
   return tier === 1 ? TEN_INVITE_BONUS_KEY : `${TEN_INVITE_BONUS_KEY}_${tier}`;
@@ -25,6 +26,20 @@ function displayName(user) {
 function displayDbName(row, idField = "user_id") {
   const parts = [row.first_name, row.last_name].filter(Boolean);
   return row.username || parts.join(" ") || String(row[idField]);
+}
+
+function isPostgresBigint(value) {
+  if (!/^\d+$/.test(value)) return false;
+
+  try {
+    return BigInt(value) <= POSTGRES_BIGINT_MAX;
+  } catch {
+    return false;
+  }
+}
+
+function isTelegramUsernameTarget(value) {
+  return /^@[A-Za-z0-9_]{5,32}$/.test(value);
 }
 
 function formatDate(value) {
@@ -381,9 +396,15 @@ async function sendInviterDetail(chatId, text) {
     return;
   }
 
-  const result = target.startsWith("@")
-    ? await query("SELECT * FROM inviters WHERE lower(username) = lower($1)", [target])
-    : await query("SELECT * FROM inviters WHERE user_id = $1", [target]);
+  let result;
+  if (isTelegramUsernameTarget(target)) {
+    result = await query("SELECT * FROM inviters WHERE lower(username) = lower($1)", [target]);
+  } else if (isPostgresBigint(target)) {
+    result = await query("SELECT * FROM inviters WHERE user_id = $1", [target]);
+  } else {
+    await sendMessage(chatId, "用法：/user 123456789 或 /user @username\n不能直接用昵称查询。");
+    return;
+  }
 
   const inviter = result.rows[0];
   if (!inviter) {
