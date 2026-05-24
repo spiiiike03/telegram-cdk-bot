@@ -330,6 +330,18 @@ async function getStats(inviterId) {
   };
 }
 
+function staleRewardNoticeText(stats, intro = null) {
+  return [
+    "有效邀请小于已发放 CDK",
+    "",
+    intro,
+    `有效邀请：${stats.activeCount}｜已失效：${stats.inactiveCount}｜已发常规 CDK：${stats.regularDeliveredRewards}`,
+    `下次发放还差：${stats.needed} 人`,
+    "",
+    "说明：退频道的邀请会失效，不计入后续奖励。需补回有效邀请数并超过已发 CDK 数后，才会继续发放。"
+  ].filter(Boolean).join("\n");
+}
+
 function statsText(link, stats) {
   const blacklistNotice = stats.blacklisted
     ? [
@@ -338,15 +350,7 @@ function statsText(link, stats) {
       ].join("\n")
     : null;
   const staleRewardNotice = stats.activeCount < stats.regularDeliveredRewards
-    ? [
-        "有效邀请小于已发放 CDK",
-        "",
-        `有效邀请：${stats.activeCount}｜已失效：${stats.inactiveCount}｜已发常规 CDK：${stats.regularDeliveredRewards}`,
-        `下次发放还差：${stats.needed} 人`,
-        "",
-        "说明：退频道的邀请会失效，不计入后续奖励。需补回有效邀请数并超过已发 CDK 数后，才会继续发放。",
-        ""
-      ].join("\n")
+    ? `${staleRewardNoticeText(stats)}\n`
     : null;
   const bonusPendingText = stats.bonusPendingRewards > 0
     ? `，待补发 ${stats.bonusPendingRewards} 个`
@@ -376,6 +380,16 @@ function statsText(link, stats) {
     "",
     "只有通过上面的专属链接加入频道的新用户才会计入。"
   ].filter(Boolean).join("\n");
+}
+
+async function notifyStaleRewardAfterInvite(inviterId) {
+  const stats = await getStats(inviterId);
+  if (stats.blacklisted || stats.activeCount >= stats.regularDeliveredRewards) return;
+
+  await sendMessage(
+    inviterId,
+    staleRewardNoticeText(stats, "本次邀请已计入有效邀请，但暂不发放 CDK。")
+  ).catch(() => null);
 }
 
 async function sendUserStats(user, chatId) {
@@ -1145,6 +1159,7 @@ async function recordMemberJoin(memberUpdate, inviter = null) {
 
   if (awardInviterId) {
     await awardRewards(awardInviterId);
+    await notifyStaleRewardAfterInvite(awardInviterId);
   }
 }
 
