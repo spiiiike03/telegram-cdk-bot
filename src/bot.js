@@ -28,6 +28,11 @@ function displayDbName(row, idField = "user_id") {
   return row.username || parts.join(" ") || String(row[idField]);
 }
 
+function displayPrefixedName(row, prefix, idField) {
+  const parts = [row[`${prefix}_first_name`], row[`${prefix}_last_name`]].filter(Boolean);
+  return row[`${prefix}_username`] || parts.join(" ") || String(row[idField] || "-");
+}
+
 function isPostgresBigint(value) {
   if (!/^\d+$/.test(value)) return false;
 
@@ -40,6 +45,11 @@ function isPostgresBigint(value) {
 
 function isTelegramUsernameTarget(value) {
   return /^@[A-Za-z0-9_]{5,32}$/.test(value);
+}
+
+function normalizeTelegramUsernameTarget(value) {
+  if (!/^@?[A-Za-z0-9_]{5,32}$/.test(value)) return null;
+  return value.startsWith("@") ? value : `@${value}`;
 }
 
 function commandBody(text, commandName) {
@@ -632,6 +642,121 @@ async function sendInviterDetail(chatId, text) {
   await sendMessage(chatId, lines.join("\n"));
 }
 
+async function sendInvitedDetail(chatId, text, commandName = "invited") {
+  const { target } = parseTargetCommand(text, commandName);
+  if (!target) {
+    await sendMessage(chatId, `用法：/${commandName} 123456789 或 /${commandName} @username`);
+    return;
+  }
+
+  const usernameTarget = normalizeTelegramUsernameTarget(target);
+  const isNumericTarget = isPostgresBigint(target);
+  if (!usernameTarget && !isNumericTarget) {
+    await sendMessage(chatId, `用法：/${commandName} 123456789 或 /${commandName} @username`);
+    return;
+  }
+
+  const memberCondition = isNumericTarget
+    ? "c.user_id = $1"
+    : "lower(c.username) = lower($1)";
+  const referralCondition = isNumericTarget
+    ? "r.invited_user_id = $1"
+    : "lower(r.invited_username) = lower($1)";
+  const lookupValue = isNumericTarget ? target : usernameTarget;
+
+  const memberResult = await query(
+    `
+      SELECT
+        c.user_id::text AS user_id,
+        c.username,
+        c.first_name,
+        c.last_name,
+        c.first_seen_at,
+        c.joined_at,
+        c.left_at,
+        c.active,
+        c.last_status,
+        c.first_inviter_id::text AS first_inviter_id,
+        c.first_invite_link,
+        i.username AS inviter_username,
+        i.first_name AS inviter_first_name,
+        i.last_name AS inviter_last_name,
+        i.invite_link AS inviter_current_link
+      FROM channel_members c
+      LEFT JOIN inviters i ON i.user_id = c.first_inviter_id
+      WHERE ${memberCondition}
+      ORDER BY c.updated_at DESC
+      LIMIT 1
+    `,
+    [lookupValue]
+  );
+
+  const referralResult = await query(
+    `
+      SELECT
+        r.invited_user_id::text AS user_id,
+        r.invited_username AS username,
+        r.invited_first_name AS first_name,
+        r.invited_last_name AS last_name,
+        r.inviter_id::text AS inviter_id,
+        r.invite_link,
+        r.joined_at,
+        r.left_at,
+        r.active,
+        r.last_status,
+        i.username AS inviter_username,
+        i.first_name AS inviter_first_name,
+        i.last_name AS inviter_last_name,
+        i.invite_link AS inviter_current_link
+      FROM referrals r
+      LEFT JOIN inviters i ON i.user_id = r.inviter_id
+      WHERE ${referralCondition}
+      ORDER BY r.joined_at DESC
+      LIMIT 1
+    `,
+    [lookupValue]
+  );
+
+  const member = memberResult.rows[0] || null;
+  const referral = referralResult.rows[0] || null;
+  const user = referral || member;
+
+  if (!user) {
+    await sendMessage(chatId, "没有找到这个被邀请人记录。可能他没有进过频道，或进频道时没有被 bot 记录到。");
+    return;
+  }
+
+  const inviterId = referral ? referral.inviter_id : member.first_inviter_id;
+  const inviterName = referral
+    ? displayPrefixedName(referral, "inviter", "inviter_id")
+    : displayPrefixedName(member, "inviter", "first_inviter_id");
+  const inviteLink = referral ? referral.invite_link : member.first_invite_link;
+  const active = referral ? referral.active : member.active;
+  const joinedAt = referral ? referral.joined_at : member.joined_at;
+  const leftAt = referral ? referral.left_at : member.left_at;
+  const lastStatus = referral ? referral.last_status : member.last_status;
+  const countedText = referral
+    ? (referral.active ? "是，当前有效" : "曾计入，现已失效")
+    : "否";
+
+  const lines = [
+    `被邀请人：${displayDbName(user)}`,
+    `ID：${user.user_id}`,
+    `当前频道状态：${active ? "在频道" : "已退/不在频道"}`,
+    `进入时间：${formatDate(joinedAt)}`,
+    leftAt ? `退出时间：${formatDate(leftAt)}` : null,
+    lastStatus ? `最后状态：${lastStatus}` : null,
+    "",
+    inviterId ? `邀请人：${inviterName} (${inviterId})` : "邀请人：无记录",
+    inviteLink ? `邀请链接：${inviteLink}` : "邀请链接：无记录",
+    `是否计入邀请奖励：${countedText}`,
+    member && member.first_seen_at ? `首次记录时间：${formatDate(member.first_seen_at)}` : null,
+    !inviterId ? "说明：通常是公开链接、频道搜索或未带专属邀请链接进入。" : null
+  ].filter(Boolean);
+
+  await sendMessage(chatId, lines.join("\n"));
+}
+
 async function resolveUserTarget(target) {
   if (isTelegramUsernameTarget(target)) {
     const result = await query("SELECT * FROM inviters WHERE lower(username) = lower($1)", [target]);
@@ -766,6 +891,7 @@ async function sendAdminHelp(chatId) {
       "/stats - 查看后台总览",
       "/top - 查看今日有效邀请 TOP 5",
       "/user 123456789 - 查看邀请人和被邀请人明细",
+      "/invited 123456789 - 查看被邀请人从哪条链接进入",
       "/blacklist 123456789 原因 - 拉黑用户，停止发奖",
       "/unblacklist 123456789 - 解除拉黑",
       "/blacklistlist - 查看黑名单",
@@ -842,6 +968,15 @@ async function handleMessage(message) {
       return;
     }
     await sendInviterDetail(message.chat.id, text);
+    return;
+  }
+
+  if (command === "/invited" || command === "/member") {
+    if (!isAdmin(message.from)) {
+      await sendMessage(message.chat.id, "没有权限。");
+      return;
+    }
+    await sendInvitedDetail(message.chat.id, text, command.slice(1));
     return;
   }
 
