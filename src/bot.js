@@ -127,6 +127,10 @@ async function getStats(inviterId) {
     "SELECT COUNT(*)::int AS count FROM referrals WHERE inviter_id = $1 AND active = TRUE",
     [inviterId]
   );
+  const inactive = await query(
+    "SELECT COUNT(*)::int AS count FROM referrals WHERE inviter_id = $1 AND active = FALSE",
+    [inviterId]
+  );
   const rewards = await query(
     `
       SELECT
@@ -151,6 +155,7 @@ async function getStats(inviterId) {
   );
 
   const activeCount = active.rows[0].count;
+  const inactiveCount = inactive.rows[0].count;
   const totalRewards = rewards.rows[0].total;
   const regularDeliveredRewards = rewards.rows[0].delivered;
   const regularPendingRewards = rewards.rows[0].pending;
@@ -174,6 +179,7 @@ async function getStats(inviterId) {
 
   return {
     activeCount,
+    inactiveCount,
     totalRewards,
     regularDeliveredRewards,
     regularPendingRewards,
@@ -191,6 +197,17 @@ async function getStats(inviterId) {
 }
 
 function statsText(link, stats) {
+  const staleRewardNotice = stats.activeCount < stats.regularDeliveredRewards
+    ? [
+        "有效邀请小于已发放 CDK",
+        "",
+        `有效邀请：${stats.activeCount}｜已失效：${stats.inactiveCount}｜已发常规 CDK：${stats.regularDeliveredRewards}`,
+        `下次发放还差：${stats.needed} 人`,
+        "",
+        "说明：退频道的邀请会失效，不计入后续奖励。需补回有效邀请数并超过已发 CDK 数后，才会继续发放。",
+        ""
+      ].join("\n")
+    : null;
   const bonusPendingText = stats.bonusPendingRewards > 0
     ? `，待补发 ${stats.bonusPendingRewards} 个`
     : "";
@@ -201,6 +218,7 @@ function statsText(link, stats) {
       : `每满 ${config.tenInviteBonusThreshold} 人额外奖励：还差 ${stats.bonusNeeded} 人`;
 
   return [
+    staleRewardNotice,
     "你的专属邀请链接：",
     link,
     "",
