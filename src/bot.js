@@ -57,7 +57,17 @@ function parseTargetCommand(text, commandName) {
 
 function formatDate(value) {
   if (!value) return "-";
-  return new Date(value).toISOString().replace("T", " ").slice(0, 16);
+  const parts = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: config.reportTimezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(new Date(value));
+  const part = (type) => parts.find((item) => item.type === type).value;
+  return `${part("year")}-${part("month")}-${part("day")} ${part("hour")}:${part("minute")}`;
 }
 
 function formatReportDate(date = new Date()) {
