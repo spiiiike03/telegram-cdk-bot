@@ -94,3 +94,12 @@ CREATE TABLE IF NOT EXISTS bonus_rewards (
 CREATE INDEX IF NOT EXISTS bonus_rewards_pending_idx
   ON bonus_rewards(id)
   WHERE cdk_id IS NULL;
+
+CREATE TABLE IF NOT EXISTS reward_blacklist (
+  user_id BIGINT PRIMARY KEY,
+  reason TEXT,
+  created_by BIGINT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_notified_at TIMESTAMPTZ
+);

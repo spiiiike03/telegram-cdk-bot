@@ -42,6 +42,19 @@ function isTelegramUsernameTarget(value) {
   return /^@[A-Za-z0-9_]{5,32}$/.test(value);
 }
 
+function commandBody(text, commandName) {
+  return text.replace(new RegExp(`^\\/${commandName}(?:@\\w+)?`, "i"), "").trim();
+}
+
+function parseTargetCommand(text, commandName) {
+  const body = commandBody(text, commandName);
+  const [target = "", ...rest] = body.split(/\s+/).filter(Boolean);
+  return {
+    target,
+    rest: rest.join(" ").trim()
+  };
+}
+
 function formatDate(value) {
   if (!value) return "-";
   return new Date(value).toISOString().replace("T", " ").slice(0, 16);
@@ -122,7 +135,100 @@ async function getInviterByLink(inviteLink) {
   return result.rows[0] || null;
 }
 
+let rewardBlacklistTableReady = false;
+
+async function ensureRewardBlacklistTable() {
+  if (rewardBlacklistTableReady) return;
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS reward_blacklist (
+      user_id BIGINT PRIMARY KEY,
+      reason TEXT,
+      created_by BIGINT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_notified_at TIMESTAMPTZ
+    )
+  `);
+  rewardBlacklistTableReady = true;
+}
+
+async function getBlacklistEntry(inviterId) {
+  await ensureRewardBlacklistTable();
+  const result = await query(
+    "SELECT user_id::text AS user_id, reason, created_at, last_notified_at FROM reward_blacklist WHERE user_id = $1",
+    [inviterId]
+  );
+  return result.rows[0] || null;
+}
+
+function blacklistNoticeText(entry = {}) {
+  return [
+    "你已被拉黑，无法获得邀请奖励。",
+    entry.reason ? `原因：${entry.reason}` : null,
+    "如有疑问请联系管理员。"
+  ].filter(Boolean).join("\n");
+}
+
+async function notifyBlacklistedUser(inviterId, entry) {
+  await sendMessage(inviterId, blacklistNoticeText(entry)).catch(() => null);
+  await ensureRewardBlacklistTable();
+  await query("UPDATE reward_blacklist SET last_notified_at = NOW() WHERE user_id = $1", [inviterId]);
+}
+
+async function markPendingRewardsBlacklisted(inviterId) {
+  await query(
+    "UPDATE rewards SET delivery_error = $2 WHERE inviter_id = $1 AND cdk_id IS NULL",
+    [inviterId, "BLACKLISTED"]
+  );
+  await query(
+    "UPDATE bonus_rewards SET delivery_error = $2 WHERE inviter_id = $1 AND cdk_id IS NULL",
+    [inviterId, "BLACKLISTED"]
+  );
+}
+
+async function suppressBlacklistedRewards(inviterId) {
+  const stats = await getStats(inviterId);
+  const regularEligibleRewards = Math.floor(stats.activeCount / config.inviteTarget);
+  const shouldHaveRewards = config.maxRewardsPerInviter === 0
+    ? regularEligibleRewards
+    : Math.min(regularEligibleRewards, config.maxRewardsPerInviter);
+
+  for (let rewardNumber = stats.totalRewards + 1; rewardNumber <= shouldHaveRewards; rewardNumber += 1) {
+    await query(
+      `
+        INSERT INTO rewards (
+          inviter_id, reward_number, active_count_at_award, cdk_id, delivery_error
+        )
+        VALUES ($1, $2, $3, NULL, 'BLACKLISTED')
+        ON CONFLICT (inviter_id, reward_number) DO NOTHING
+      `,
+      [inviterId, rewardNumber, stats.activeCount]
+    );
+  }
+
+  const bonusEligibleRewards = Math.floor(stats.activeCount / config.tenInviteBonusThreshold);
+  for (let bonusNumber = stats.bonusTotalRewards + 1; bonusNumber <= bonusEligibleRewards; bonusNumber += 1) {
+    await query(
+      `
+        INSERT INTO bonus_rewards (
+          inviter_id, bonus_key, threshold, active_count_at_award, cdk_id, delivery_error
+        )
+        VALUES ($1, $2, $3, $4, NULL, 'BLACKLISTED')
+        ON CONFLICT (inviter_id, bonus_key) DO NOTHING
+      `,
+      [
+        inviterId,
+        bonusKeyForTier(bonusNumber),
+        bonusNumber * config.tenInviteBonusThreshold,
+        stats.activeCount
+      ]
+    );
+  }
+}
+
 async function getStats(inviterId) {
+  const blacklist = await getBlacklistEntry(inviterId);
   const active = await query(
     "SELECT COUNT(*)::int AS count FROM referrals WHERE inviter_id = $1 AND active = TRUE",
     [inviterId]
@@ -136,7 +242,10 @@ async function getStats(inviterId) {
       SELECT
         COUNT(*)::int AS total,
         COUNT(cdk_id)::int AS delivered,
-        COUNT(*) FILTER (WHERE cdk_id IS NULL)::int AS pending
+        COUNT(*) FILTER (
+          WHERE cdk_id IS NULL
+            AND COALESCE(delivery_error, '') <> 'BLACKLISTED'
+        )::int AS pending
       FROM rewards
       WHERE inviter_id = $1
     `,
@@ -147,7 +256,10 @@ async function getStats(inviterId) {
       SELECT
         COUNT(*)::int AS total,
         COUNT(cdk_id)::int AS delivered,
-        COUNT(*) FILTER (WHERE cdk_id IS NULL)::int AS pending
+        COUNT(*) FILTER (
+          WHERE cdk_id IS NULL
+            AND COALESCE(delivery_error, '') <> 'BLACKLISTED'
+        )::int AS pending
       FROM bonus_rewards
       WHERE inviter_id = $1
     `,
@@ -180,6 +292,8 @@ async function getStats(inviterId) {
   return {
     activeCount,
     inactiveCount,
+    blacklisted: Boolean(blacklist),
+    blacklistReason: blacklist ? blacklist.reason : null,
     totalRewards,
     regularDeliveredRewards,
     regularPendingRewards,
@@ -197,6 +311,12 @@ async function getStats(inviterId) {
 }
 
 function statsText(link, stats) {
+  const blacklistNotice = stats.blacklisted
+    ? [
+        blacklistNoticeText({ reason: stats.blacklistReason }),
+        ""
+      ].join("\n")
+    : null;
   const staleRewardNotice = stats.activeCount < stats.regularDeliveredRewards
     ? [
         "有效邀请小于已发放 CDK",
@@ -218,8 +338,9 @@ function statsText(link, stats) {
       : `每满 ${config.tenInviteBonusThreshold} 人额外奖励：还差 ${stats.bonusNeeded} 人`;
 
   return [
+    blacklistNotice,
     staleRewardNotice,
-    "你的专属邀请链接：",
+    link ? "你的专属邀请链接：" : null,
     link,
     "",
     `有效邀请：${stats.activeCount}`,
@@ -238,9 +359,18 @@ function statsText(link, stats) {
 }
 
 async function sendUserStats(user, chatId) {
+  const id = userId(user);
+  await upsertInviter(user);
   const link = await getOrCreateInviteLink(user);
-  await awardRewards(userId(user));
-  const stats = await getStats(userId(user));
+
+  let stats = await getStats(id);
+  if (stats.blacklisted) {
+    await sendMessage(chatId, statsText(link, stats));
+    return;
+  }
+
+  await awardRewards(id);
+  stats = await getStats(id);
   await sendMessage(chatId, statsText(link, stats));
 }
 
@@ -277,8 +407,8 @@ async function sendInventory(chatId) {
         COUNT(*) FILTER (WHERE used_by IS NULL)::int AS unused,
         COUNT(*) FILTER (WHERE used_by IS NOT NULL)::int AS used,
         (
-          (SELECT COUNT(*)::int FROM rewards WHERE cdk_id IS NULL) +
-          (SELECT COUNT(*)::int FROM bonus_rewards WHERE cdk_id IS NULL)
+          (SELECT COUNT(*)::int FROM rewards WHERE cdk_id IS NULL AND COALESCE(delivery_error, '') <> 'BLACKLISTED') +
+          (SELECT COUNT(*)::int FROM bonus_rewards WHERE cdk_id IS NULL AND COALESCE(delivery_error, '') <> 'BLACKLISTED')
         ) AS pending
       FROM cdks
     `
@@ -308,6 +438,7 @@ async function getLeaderboardExcludedIds() {
 }
 
 async function sendAdminStats(chatId) {
+  await ensureRewardBlacklistTable();
   const result = await query(
     `
       SELECT
@@ -316,6 +447,7 @@ async function sendAdminStats(chatId) {
         (SELECT COUNT(*)::int FROM referrals WHERE active = TRUE) AS active_referrals,
         (SELECT COUNT(*)::int FROM referrals WHERE active = FALSE) AS inactive_referrals,
         (SELECT COUNT(*)::int FROM channel_members WHERE active = TRUE) AS active_channel_members,
+        (SELECT COUNT(*)::int FROM reward_blacklist) AS blacklisted_users,
         (SELECT COUNT(*)::int FROM cdks WHERE used_by IS NULL) AS unused_cdks,
         (SELECT COUNT(*)::int FROM cdks WHERE used_by IS NOT NULL) AS used_cdks,
         (SELECT COUNT(*)::int FROM rewards) AS regular_rewards,
@@ -329,8 +461,8 @@ async function sendAdminStats(chatId) {
           (SELECT COUNT(*)::int FROM bonus_rewards WHERE cdk_id IS NOT NULL)
         ) AS delivered_rewards,
         (
-          (SELECT COUNT(*)::int FROM rewards WHERE cdk_id IS NULL) +
-          (SELECT COUNT(*)::int FROM bonus_rewards WHERE cdk_id IS NULL)
+          (SELECT COUNT(*)::int FROM rewards WHERE cdk_id IS NULL AND COALESCE(delivery_error, '') <> 'BLACKLISTED') +
+          (SELECT COUNT(*)::int FROM bonus_rewards WHERE cdk_id IS NULL AND COALESCE(delivery_error, '') <> 'BLACKLISTED')
         ) AS pending_rewards
     `
   );
@@ -345,6 +477,7 @@ async function sendAdminStats(chatId) {
       `有效邀请：${row.active_referrals}`,
       `已退/失效：${row.inactive_referrals}`,
       `当前频道成员记录：${row.active_channel_members}`,
+      `黑名单用户：${row.blacklisted_users}`,
       "",
       `CDK 库存：${row.unused_cdks}`,
       `CDK 已用：${row.used_cdks}`,
@@ -358,6 +491,7 @@ async function sendAdminStats(chatId) {
 }
 
 async function sendTopInviters(chatId) {
+  await ensureRewardBlacklistTable();
   const excludedIds = await getLeaderboardExcludedIds();
   const result = await query(
     `
@@ -378,7 +512,8 @@ async function sendTopInviters(chatId) {
         AND r.joined_at >= bounds.start_at
         AND r.joined_at < bounds.end_at
       JOIN inviters i ON i.user_id = r.inviter_id
-      WHERE NOT (i.user_id = ANY($1::bigint[]))
+      LEFT JOIN reward_blacklist b ON b.user_id = i.user_id
+      WHERE b.user_id IS NULL AND NOT (i.user_id = ANY($1::bigint[]))
       GROUP BY i.user_id, i.username, i.first_name, i.last_name
       HAVING COUNT(*) > 0
       ORDER BY invite_count DESC, i.user_id ASC
@@ -457,6 +592,7 @@ async function sendInviterDetail(chatId, text) {
     `邀请人：${displayDbName(inviter)}`,
     `ID：${inviter.user_id}`,
     inviter.invite_link ? `邀请链接：${inviter.invite_link}` : "邀请链接：未生成",
+    stats.blacklisted ? `黑名单：是${stats.blacklistReason ? `，原因：${stats.blacklistReason}` : ""}` : "黑名单：否",
     "",
     `有效邀请：${stats.activeCount}`,
     `总邀请记录：${total.rows[0].count}`,
@@ -486,6 +622,131 @@ async function sendInviterDetail(chatId, text) {
   await sendMessage(chatId, lines.join("\n"));
 }
 
+async function resolveUserTarget(target) {
+  if (isTelegramUsernameTarget(target)) {
+    const result = await query("SELECT * FROM inviters WHERE lower(username) = lower($1)", [target]);
+    const inviter = result.rows[0];
+    if (!inviter) {
+      return { error: "没有找到这个用户名，请改用 Telegram 数字 user id。" };
+    }
+    return { userId: String(inviter.user_id), inviter };
+  }
+
+  if (isPostgresBigint(target)) {
+    const result = await query("SELECT * FROM inviters WHERE user_id = $1", [target]);
+    return { userId: target, inviter: result.rows[0] || null };
+  }
+
+  return { error: "用法：/blacklist 123456789 原因 或 /blacklist @username 原因" };
+}
+
+async function blacklistUser(chatId, text, adminId) {
+  await ensureRewardBlacklistTable();
+  const { target, rest: reason } = parseTargetCommand(text, "blacklist");
+  if (!target) {
+    await sendMessage(chatId, "用法：/blacklist 123456789 原因 或 /blacklist @username 原因");
+    return;
+  }
+
+  const resolved = await resolveUserTarget(target);
+  if (resolved.error) {
+    await sendMessage(chatId, resolved.error);
+    return;
+  }
+
+  await query(
+    `
+      INSERT INTO reward_blacklist (user_id, reason, created_by, updated_at)
+      VALUES ($1, $2, $3, NOW())
+      ON CONFLICT (user_id)
+      DO UPDATE SET
+        reason = EXCLUDED.reason,
+        created_by = EXCLUDED.created_by,
+        updated_at = NOW()
+    `,
+    [resolved.userId, reason || null, adminId]
+  );
+  await markPendingRewardsBlacklisted(resolved.userId);
+  await suppressBlacklistedRewards(resolved.userId);
+  await notifyBlacklistedUser(resolved.userId, { reason: reason || null });
+
+  await sendMessage(
+    chatId,
+    [
+      `已拉黑：${resolved.inviter ? displayDbName(resolved.inviter) : resolved.userId}`,
+      `ID：${resolved.userId}`,
+      reason ? `原因：${reason}` : null,
+      "该用户将不能再获得邀请奖励。"
+    ].filter(Boolean).join("\n")
+  );
+}
+
+async function unblacklistUser(chatId, text) {
+  await ensureRewardBlacklistTable();
+  const { target } = parseTargetCommand(text, "unblacklist");
+  if (!target) {
+    await sendMessage(chatId, "用法：/unblacklist 123456789 或 /unblacklist @username");
+    return;
+  }
+
+  const resolved = await resolveUserTarget(target);
+  if (resolved.error) {
+    await sendMessage(chatId, resolved.error.replace("/blacklist", "/unblacklist"));
+    return;
+  }
+
+  const result = await query(
+    "DELETE FROM reward_blacklist WHERE user_id = $1 RETURNING user_id",
+    [resolved.userId]
+  );
+
+  if (result.rows.length === 0) {
+    await sendMessage(chatId, "该用户不在黑名单中。");
+    return;
+  }
+
+  await sendMessage(resolved.userId, "你的邀请奖励限制已解除，可以继续获得邀请奖励。").catch(() => null);
+  await sendMessage(
+    chatId,
+    [
+      `已解除拉黑：${resolved.inviter ? displayDbName(resolved.inviter) : resolved.userId}`,
+      `ID：${resolved.userId}`
+    ].join("\n")
+  );
+}
+
+async function sendBlacklist(chatId) {
+  await ensureRewardBlacklistTable();
+  const result = await query(
+    `
+      SELECT
+        b.user_id::text AS user_id,
+        b.reason,
+        b.created_at,
+        i.username,
+        i.first_name,
+        i.last_name
+      FROM reward_blacklist b
+      LEFT JOIN inviters i ON i.user_id = b.user_id
+      ORDER BY b.created_at DESC
+      LIMIT 30
+    `
+  );
+
+  if (result.rows.length === 0) {
+    await sendMessage(chatId, "黑名单为空。");
+    return;
+  }
+
+  const lines = ["黑名单（最近 30 条）："];
+  result.rows.forEach((row, index) => {
+    lines.push(
+      `${index + 1}. ${displayDbName(row)} (${row.user_id})${row.reason ? `，原因：${row.reason}` : ""}`
+    );
+  });
+  await sendMessage(chatId, lines.join("\n"));
+}
+
 async function sendAdminHelp(chatId) {
   await sendMessage(
     chatId,
@@ -495,6 +756,9 @@ async function sendAdminHelp(chatId) {
       "/stats - 查看后台总览",
       "/top - 查看今日有效邀请 TOP 5",
       "/user 123456789 - 查看邀请人和被邀请人明细",
+      "/blacklist 123456789 原因 - 拉黑用户，停止发奖",
+      "/unblacklist 123456789 - 解除拉黑",
+      "/blacklistlist - 查看黑名单",
       "/syncrewards - 同步已达标但未发放的奖励",
       "/addcdk CODE1 CODE2 - 导入 CDK"
     ].join("\n")
@@ -568,6 +832,33 @@ async function handleMessage(message) {
       return;
     }
     await sendInviterDetail(message.chat.id, text);
+    return;
+  }
+
+  if (command === "/blacklist") {
+    if (!isAdmin(message.from)) {
+      await sendMessage(message.chat.id, "没有权限。");
+      return;
+    }
+    await blacklistUser(message.chat.id, text, userId(message.from));
+    return;
+  }
+
+  if (command === "/unblacklist") {
+    if (!isAdmin(message.from)) {
+      await sendMessage(message.chat.id, "没有权限。");
+      return;
+    }
+    await unblacklistUser(message.chat.id, text);
+    return;
+  }
+
+  if (command === "/blacklistlist") {
+    if (!isAdmin(message.from)) {
+      await sendMessage(message.chat.id, "没有权限。");
+      return;
+    }
+    await sendBlacklist(message.chat.id);
     return;
   }
 
@@ -919,6 +1210,16 @@ async function createBonusReward(inviterId, bonusKey, threshold, activeCount) {
 }
 
 async function awardRewards(inviterId) {
+  const blacklist = await getBlacklistEntry(inviterId);
+  if (blacklist) {
+    await markPendingRewardsBlacklisted(inviterId);
+    await suppressBlacklistedRewards(inviterId);
+    if (!blacklist.last_notified_at) {
+      await notifyBlacklistedUser(inviterId, blacklist);
+    }
+    return;
+  }
+
   const stats = await getStats(inviterId);
   const regularEligibleRewards = Math.floor(stats.activeCount / config.inviteTarget);
   const shouldHaveRewards = config.maxRewardsPerInviter === 0
@@ -944,6 +1245,13 @@ async function awardRewards(inviterId) {
 }
 
 async function fulfillPendingRewardsForInviter(inviterId) {
+  const blacklist = await getBlacklistEntry(inviterId);
+  if (blacklist) {
+    await markPendingRewardsBlacklisted(inviterId);
+    await suppressBlacklistedRewards(inviterId);
+    return;
+  }
+
   const active = await query(
     "SELECT COUNT(*)::int AS count FROM referrals WHERE inviter_id = $1 AND active = TRUE",
     [inviterId]
@@ -954,6 +1262,7 @@ async function fulfillPendingRewardsForInviter(inviterId) {
       SELECT id, reward_number
       FROM rewards
       WHERE inviter_id = $1 AND cdk_id IS NULL
+        AND COALESCE(delivery_error, '') <> 'BLACKLISTED'
       ORDER BY reward_number
     `,
     [inviterId]
@@ -970,7 +1279,7 @@ async function fulfillPendingRewardsForInviter(inviterId) {
 
     const reserved = await transaction(async (client) => {
       const locked = await client.query(
-        "SELECT id FROM rewards WHERE id = $1 AND cdk_id IS NULL FOR UPDATE",
+        "SELECT id FROM rewards WHERE id = $1 AND cdk_id IS NULL AND COALESCE(delivery_error, '') <> 'BLACKLISTED' FOR UPDATE",
         [reward.id]
       );
       if (!locked.rows[0]) return null;
@@ -1002,6 +1311,7 @@ async function fulfillPendingRewardsForInviter(inviterId) {
       SELECT id, bonus_key, threshold
       FROM bonus_rewards
       WHERE inviter_id = $1 AND cdk_id IS NULL
+        AND COALESCE(delivery_error, '') <> 'BLACKLISTED'
       ORDER BY threshold, id
     `,
     [inviterId]
@@ -1018,7 +1328,7 @@ async function fulfillPendingRewardsForInviter(inviterId) {
 
     const reserved = await transaction(async (client) => {
       const locked = await client.query(
-        "SELECT id FROM bonus_rewards WHERE id = $1 AND cdk_id IS NULL FOR UPDATE",
+        "SELECT id FROM bonus_rewards WHERE id = $1 AND cdk_id IS NULL AND COALESCE(delivery_error, '') <> 'BLACKLISTED' FOR UPDATE",
         [reward.id]
       );
       if (!locked.rows[0]) return null;
