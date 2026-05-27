@@ -5,6 +5,7 @@ const { createInviteLink, notifyAdmins, sendMessage, telegram } = require("./tel
 const ACTIVE_STATUSES = new Set(["creator", "administrator", "member"]);
 const TEN_INVITE_BONUS_KEY = "ten_invites";
 const POSTGRES_BIGINT_MAX = 9223372036854775807n;
+const SAME_SECOND_AUTO_BLACKLIST_THRESHOLD = 20;
 
 function bonusKeyForTier(tier) {
   return tier === 1 ? TEN_INVITE_BONUS_KEY : `${TEN_INVITE_BONUS_KEY}_${tier}`;
@@ -245,6 +246,42 @@ async function suppressBlacklistedRewards(inviterId) {
       ]
     );
   }
+}
+
+async function autoBlacklistForSameSecondBurst(inviterId, joinedAtUnixSeconds) {
+  if (await getBlacklistEntry(inviterId)) return true;
+
+  const burst = await query(
+    `
+      SELECT COUNT(*)::int AS count
+      FROM referrals
+      WHERE inviter_id = $1
+        AND joined_at >= TO_TIMESTAMP($2)
+        AND joined_at < TO_TIMESTAMP($2) + INTERVAL '1 second'
+    `,
+    [inviterId, joinedAtUnixSeconds]
+  );
+  const burstCount = burst.rows[0].count;
+  if (burstCount <= SAME_SECOND_AUTO_BLACKLIST_THRESHOLD) return false;
+
+  const reason = `自动风控：同一秒邀请 ${burstCount} 人，超过 ${SAME_SECOND_AUTO_BLACKLIST_THRESHOLD} 人阈值`;
+  await ensureRewardBlacklistTable();
+  await query(
+    `
+      INSERT INTO reward_blacklist (user_id, reason, created_by, updated_at)
+      VALUES ($1, $2, NULL, NOW())
+      ON CONFLICT (user_id)
+      DO UPDATE SET
+        reason = EXCLUDED.reason,
+        updated_at = NOW()
+    `,
+    [inviterId, reason]
+  );
+  await markPendingRewardsBlacklisted(inviterId);
+  await suppressBlacklistedRewards(inviterId);
+  await notifyBlacklistedUser(inviterId, { reason });
+  await notifyAdmins(`自动拉黑：用户 ${inviterId} 同一秒邀请 ${burstCount} 人，已停止发放奖励。`);
+  return true;
 }
 
 async function getStats(inviterId) {
@@ -1045,6 +1082,7 @@ async function recordMemberJoin(memberUpdate, inviter = null) {
   if (invitedId === inviterId) return;
 
   let awardInviterId = null;
+  let burstCheck = null;
 
   await transaction(async (client) => {
     const existingMember = await client.query(
@@ -1155,9 +1193,17 @@ async function recordMemberJoin(memberUpdate, inviter = null) {
       ]
     );
     awardInviterId = inviterId;
+    burstCheck = { inviterId, joinedAtUnixSeconds: memberUpdate.date };
   });
 
   if (awardInviterId) {
+    if (burstCheck) {
+      const autoBlacklisted = await autoBlacklistForSameSecondBurst(
+        burstCheck.inviterId,
+        burstCheck.joinedAtUnixSeconds
+      );
+      if (autoBlacklisted) return;
+    }
     await awardRewards(awardInviterId);
     await notifyStaleRewardAfterInvite(awardInviterId);
   }
