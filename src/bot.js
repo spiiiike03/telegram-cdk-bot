@@ -197,6 +197,12 @@ async function notifyBlacklistedUser(inviterId, entry) {
   await query("UPDATE reward_blacklist SET last_notified_at = NOW() WHERE user_id = $1", [inviterId]);
 }
 
+async function notifyAutoBlacklistedUser(inviterId) {
+  await sendMessage(inviterId, "检测到短时间内异常批量邀请，奖励已取消发放").catch(() => null);
+  await ensureRewardBlacklistTable();
+  await query("UPDATE reward_blacklist SET last_notified_at = NOW() WHERE user_id = $1", [inviterId]);
+}
+
 async function markPendingRewardsBlacklisted(inviterId) {
   await query(
     "UPDATE rewards SET delivery_error = $2 WHERE inviter_id = $1 AND cdk_id IS NULL",
@@ -279,7 +285,7 @@ async function autoBlacklistForSameSecondBurst(inviterId, joinedAtUnixSeconds) {
   );
   await markPendingRewardsBlacklisted(inviterId);
   await suppressBlacklistedRewards(inviterId);
-  await notifyBlacklistedUser(inviterId, { reason });
+  await notifyAutoBlacklistedUser(inviterId);
   await notifyAdmins(`自动拉黑：用户 ${inviterId} 同一秒邀请 ${burstCount} 人，已停止发放奖励。`);
   return true;
 }
